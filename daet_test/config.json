@@ -1,0 +1,126 @@
+{
+  "comments": "An initial test for a LUS DAET setup. The sample is a one of the black mudstones, 25mm diameter, 26.5mm height, aligned vertically.\nINDI and Polytec beams are anitpodal, about halfway up. Source energy is about 70 mJ/pulse.\nSample is mounted on shaker, oscillating at 50 Hz from a 2 Vpp sine wave from the Moku lab. The pump wave is given as 4 full-cycle bursts. The bursts are repeated a bit less than every 0.1s so that the LUS wave samples a different part of the strain field each time.\nNo preamp.\n\nFirst channel is the low freq signal measured from the OFV5000 Polytec looking at the top of the sample.\nSecond channel is the LUS waveform from the OFV5000X.",
+  "directory": "/home/jonathan/.place/experiments/000022",
+  "metadata": {
+    "PLACE_version": "0.8.0",
+    "oscillator_power": "54.91 %\r\n",
+    "polytec_controller": "OFV-5000Xtra Vibrometer Controller",
+    "repeat_rate": "10.0 VAR\r\n",
+    "timestamp": 1581996031854,
+    "vd_09_calibration": 10.0,
+    "vd_09_calibration_units": "mm/s/V\n",
+    "vd_09_maximum_frequency": 250000.0,
+    "vd_09_time_delay": 15.4,
+    "vx_09_calibration": 25.0,
+    "vx_09_calibration_units": "mm/s/V\n",
+    "vx_09_maximum_frequency": 250000.0,
+    "vx_09_time_delay": 15.4,
+    "sample_rate": 100000000
+  },
+  "plugins": {
+    "ATS660": {
+      "active": true,
+      "config": {
+        "analog_inputs": [
+          {
+            "input_channel": "CHANNEL_A",
+            "input_coupling": "DC_COUPLING",
+            "input_impedance": "IMPEDANCE_50_OHM",
+            "input_range": "INPUT_RANGE_PM_800_MV"
+          },
+          {
+            "input_channel": "CHANNEL_B",
+            "input_coupling": "DC_COUPLING",
+            "input_impedance": "IMPEDANCE_50_OHM",
+            "input_range": "INPUT_RANGE_PM_200_MV"
+          }
+        ],
+        "average": false,
+        "clock_edge": "CLOCK_EDGE_RISING",
+        "clock_source": "INTERNAL_CLOCK",
+        "decimation": 0,
+        "plot": "yes",
+        "post_trigger_samples": 8192,
+        "pre_trigger_samples": 0,
+        "records": 1000,
+        "sample_rate": "SAMPLE_RATE_100MSPS",
+        "trigger_engine_1": "TRIG_ENGINE_J",
+        "trigger_engine_2": "TRIG_ENGINE_K",
+        "trigger_level_1": 153,
+        "trigger_level_2": 0,
+        "trigger_operation": "TRIG_ENGINE_OP_J",
+        "trigger_slope_1": "TRIGGER_SLOPE_POSITIVE",
+        "trigger_slope_2": "TRIGGER_SLOPE_POSITIVE",
+        "trigger_source_1": "TRIG_EXTERNAL",
+        "trigger_source_2": "TRIG_DISABLE",
+        "trigger_volts_str_1": "1.0",
+        "trigger_volts_str_2": "1.0"
+      },
+      "metadata": {
+        "elm_module_name": "ATS660",
+        "python_class_name": "ATS660",
+        "python_module_name": "alazartech"
+      },
+      "priority": 100,
+      "progress": {}
+    },
+    "PolytecOFV5000": {
+      "active": true,
+      "config": {
+        "autofocus": "none",
+        "dd_300": false,
+        "dd_300_range": "50nm/V",
+        "dd_900": false,
+        "dd_900_range": "5mm/s/V",
+        "plot": false,
+        "vd_08": false,
+        "vd_08_range": "5mm/s/V",
+        "vd_09": true,
+        "vd_09_range": "10mm/s/V"
+      },
+      "metadata": {
+        "elm_module_name": "PolytecOFV5000",
+        "python_class_name": "OFV5000",
+        "python_module_name": "polytec"
+      },
+      "priority": 50,
+      "progress": {}
+    },
+    "PolytecOFV5000X": {
+      "active": true,
+      "config": {
+        "autofocus": "none",
+        "dx_300": false,
+        "dx_300_range": "125nm/V",
+        "dx_900": false,
+        "dx_900_range": "125nm/V",
+        "plot": false,
+        "vx_09": true,
+        "vx_09_range": "25mm/s/V"
+      },
+      "metadata": {
+        "elm_module_name": "PolytecOFV5000X",
+        "python_class_name": "OFV5000X",
+        "python_module_name": "polytec"
+      },
+      "priority": 50,
+      "progress": {}
+    },
+    "QuantaRay": {
+      "active": true,
+      "config": {
+        "power_percentage": 15,
+        "watchdog_time": 110
+      },
+      "metadata": {
+        "elm_module_name": "QuantaRay",
+        "python_class_name": "QuantaRayINDI",
+        "python_module_name": "quanta_ray"
+      },
+      "priority": 0,
+      "progress": {}
+    }
+  },
+  "title": "daet_test8",
+  "updates": 1
+}
