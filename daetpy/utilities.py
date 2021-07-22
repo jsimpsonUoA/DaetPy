@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 
 from scipy.signal import correlate, detrend, resample, decimate
 from scipy.stats import linregress
+from scipy.interpolate import interp1d
 
 def coda_wave_interferometry(reference_waveform, times, data, min_time=0, 
                         max_time=1e6, window_size=20, overlap=0, taper=0, pad=0,
@@ -326,7 +327,7 @@ def dynamic_time_warping(values,times,reference='adjacent_below',downsample=1,
 
 def get_placescan_data(scan, min_time=0, max_time=np.inf, bandpass=None, averaging=1):
     '''
-    Get PlaceScan data for plotting or picking
+    Get PlaceScan data for plotting or picking. Normed is True.
     '''
 
     plot_data, plot_times = scan._get_plot_data(tmax=max_time, tmin=min_time, normed=True,bandpass=bandpass,detrend=True)
@@ -335,3 +336,140 @@ def get_placescan_data(scan, min_time=0, max_time=np.inf, bandpass=None, averagi
         values[i] = np.average(plot_data[i*averaging:(i+1)*averaging],axis=0)
 
     return values, plot_times
+
+
+def stretching_cwi(reference_waveform, times, data, min_time=0, max_time=1e6,
+                        num_iterations=2 ,max_stretch=0.1, num_windows=1, taper=0, pad=0, 
+                        plot_examples=False, return_all=False):
+    '''
+    Perform a trace-stretching type coda wave interferometry to calculate
+    the relative time difference between two time series. This algorithm
+    comes from Sens-Schoenfelder and Wegler (2006), GRL. The implementation
+    is based off the MATLAB code associated with the paper "Coda Wave 
+    Interferometry for Accurate Simultaneous Monitoring of Velocity and 
+    Acoustic Source Locations in Experimental Rock Physics" by Singh,
+    Curtis, Zhao, Cartwright-Taylor, and Main. See:
+    https://github.com/JonathanSingh/cwi_codes/blob/master/cwi_codes/cwi_stretch_vel.m
+
+    The time difference is found by stretching the query waveform(s)
+    and finding the stretching factor for which the correlation factor
+    between the reference and stretched waveform(s) is maximum. It has the
+    advantage of not averaging over a window. Unlike regular CWI, it is 
+    perfectly valid to use only one (long) window, but calculating the
+    stretching factor over multiple windows provides an estimate of the
+    uncertainty.
+
+    Arguments:
+        --reference_waveform: The reference waveform to compare the data to
+        --times: The time array for the reference_waveform and the waveforms
+            in data (must be the same for all waveforms)
+        --data: The waveform data to calculate the cwi for. This can be a 
+            1D or 2D array, where the last axis has the same length as times.
+        --min_time: The minimum time to perform cwi from. This will be the 
+            left edge of the window at the first window position.
+        --max_time: The maximum time to perform the cwi to. 
+        --num_iterations: The number of times to perform the stretch factor
+            search. Each time, the search increment decreases by a factor
+            of 20 and is re-centred around the previous iteration's best
+            stretch factor.
+        --max_stretch: The absolute value of the maximum stretching factor
+            to search for. I.e. stretch facotrs of 1 - max_stretch to
+            1 + max_stretch will be searched.
+        --num_windows: The number of windows to independently calculate the 
+                stretching factor for
+        --taper: A percentage betewen 0 and 100 specifying how much of the
+            windowed data to apply a taper to.
+        --pad: How many powers of 2 above the length of the window to pad
+            each window before correlating.
+        --plot_examples: Plot example result plots.
+        --return_all: True to return an array with all the lag times in each
+            window for all traces and a 1D array of the window centres, along
+            with dt_over_t.
+
+    Returns:
+        --dt_over_t: The average fraction by which the data waveforms(s) lag
+            the reference waveforms, determined from the gradient of the
+            best fit line of the cross correlation lags of each window.
+            Positive == data lags the reference waveform
+        --dt_std_devs: The standard deviations for each of the estimate
+            of dt_over_t
+        
+        If return_all is True:
+        --all_windows: A 2D array of shape (trace_number, window_lags)
+
+    '''
+
+    min_time, max_time = max(times[0],min_time), min(times[-1],max_time)
+    min_time_ind = np.argmin(np.abs(times-min_time))
+    max_time_ind = np.argmin(np.abs(times-max_time))
+
+    total_range_inds = max_time_ind - min_time_ind
+    window_size_ind = total_range_inds // num_windows
+
+    ref_times = np.arange(0.,len(times))  # A reference array, independent of sampling rate
+
+    if len(data.shape) < 2:
+        data = data.reshape((1,data.shape[0]))
+
+    dt_over_t = np.zeros(data.shape[0])
+    dt_std_devs = np.zeros(data.shape[0])
+    all_lags = np.zeros((data.shape[0],num_windows))
+
+    for i in range(data.shape[0]):
+        print(i)
+        comp_waveform = data[i]
+        lags = np.zeros(num_windows)
+        stretch_anchor = 0.
+
+        for it_number in range(num_iterations):
+
+            stretch_limit = max_stretch / max(20 * it_number,1)
+            s_factors = np.linspace(stretch_anchor-stretch_limit,stretch_anchor+stretch_limit,201)
+
+            for j in range(num_windows):
+
+                max_coeffs = np.zeros(len(s_factors))
+                for k, s_factor in enumerate(s_factors):
+
+                    stretched_times = ref_times / (1+s_factor)
+                    stretched_times = np.where(stretched_times < ref_times[-1], stretched_times , 0.)
+                    i_func = interp1d(ref_times,comp_waveform)
+                    stretched_waveform = i_func(stretched_times)
+
+                    left_edge = min_time_ind+j*window_size_ind
+                    right_edge = left_edge + window_size_ind
+                    ref_trace, _ = get_windowed_data(reference_waveform, 1.,min_ind=left_edge, max_ind=right_edge, apply_detrend=True,taper=taper,pad=pad)
+                    stretch_trace, _ = get_windowed_data(stretched_waveform, 1.,min_ind=left_edge, max_ind=right_edge, apply_detrend=True,taper=taper,pad=pad)
+                                                            
+                    corr = correlate(ref_trace, stretch_trace, mode='full')
+                    corr /= np.sqrt(np.dot(ref_trace, ref_trace) * np.dot(stretch_trace, stretch_trace))
+                    max_coeffs[k] = np.amax(corr)
+
+                best_stretching_factor = s_factors[np.argmax(max_coeffs)]
+                lags[j] = best_stretching_factor
+
+            all_lags[i] = lags
+            time_lag = np.mean(lags)
+            time_lag_err = np.std(lags)
+            dt_over_t[i] = time_lag
+            dt_std_devs[i] = time_lag_err
+            stretch_anchor = time_lag
+
+        if plot_examples:
+            stretched_times = ref_times / (1+time_lag)
+            stretched_times = np.where(stretched_times < ref_times[-1], stretched_times , 0.)
+            i_func = interp1d(ref_times,comp_waveform)
+            stretched_waveform = i_func(stretched_times)
+
+            plt.plot(times, reference_waveform, 'r-',label='Reference')
+            plt.plot(times, stretched_waveform, 'b-',label='Stretched Query')
+            plt.xlabel('Time ($\mu$s)'); plt.ylabel('Amplitude')
+            plt.legend(); plt.title('Best stretching factor: {}%'.format(time_lag*100.))
+            plt.show()
+
+    dt_over_t, all_lags = -1.*dt_over_t, -1.*all_lags
+
+    if not return_all:
+        return dt_over_t, dt_std_devs
+
+    return dt_over_t, dt_std_devs, all_lags
