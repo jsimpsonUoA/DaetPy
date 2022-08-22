@@ -330,7 +330,7 @@ def get_placescan_data(scan, min_time=0, max_time=np.inf, bandpass=None, averagi
     Get PlaceScan data for plotting or picking. Normed is True.
     '''
 
-    plot_data, plot_times = scan._get_plot_data(tmax=max_time, tmin=min_time, normed=True,bandpass=bandpass,detrend=True)
+    plot_data, plot_times = scan._get_plot_data(tmax=max_time, tmin=min_time, normed=False,bandpass=bandpass,detrend=True)
     values = np.zeros((plot_data.shape[0]//averaging,plot_data.shape[1]))
     for i in range(plot_data.shape[0]//averaging):
         values[i] = np.average(plot_data[i*averaging:(i+1)*averaging],axis=0)
@@ -340,7 +340,7 @@ def get_placescan_data(scan, min_time=0, max_time=np.inf, bandpass=None, averagi
 
 def stretching_cwi(reference_waveform, times, data, min_time=0, max_time=1e6,
                         num_iterations=2 ,max_stretch=0.1, num_windows=1, taper=0, pad=0, 
-                        plot_examples=False, return_all=False):
+                        plot_examples=False, return_all=False, different_references=False):
     '''
     Perform a trace-stretching type coda wave interferometry to calculate
     the relative time difference between two time series. This algorithm
@@ -360,7 +360,7 @@ def stretching_cwi(reference_waveform, times, data, min_time=0, max_time=1e6,
     uncertainty.
 
     Arguments:
-        --reference_waveform: The reference waveform to compare the data to
+        --reference_waveform: The reference waveform(s) to compare the data to
         --times: The time array for the reference_waveform and the waveforms
             in data (must be the same for all waveforms)
         --data: The waveform data to calculate the cwi for. This can be a 
@@ -385,6 +385,9 @@ def stretching_cwi(reference_waveform, times, data, min_time=0, max_time=1e6,
         --return_all: True to return an array with all the lag times in each
             window for all traces and a 1D array of the window centres, along
             with dt_over_t.
+        --different_references: True if there is a different reference for each
+            waveform. In this case, reference_waveform must be the same length
+            as data.
 
     Returns:
         --dt_over_t: The average fraction by which the data waveforms(s) lag
@@ -416,10 +419,16 @@ def stretching_cwi(reference_waveform, times, data, min_time=0, max_time=1e6,
     all_lags = np.zeros((data.shape[0],num_windows))
 
     for i in range(data.shape[0]):
-        print(i)
+        if i%100 == 0:
+            print(i)
         comp_waveform = data[i]
         lags = np.zeros(num_windows)
         stretch_anchor = 0.
+
+        if different_references:
+            ref = reference_waveform[i]
+        else:
+            ref = reference_waveform
 
         for it_number in range(num_iterations):
 
@@ -438,7 +447,7 @@ def stretching_cwi(reference_waveform, times, data, min_time=0, max_time=1e6,
 
                     left_edge = min_time_ind+j*window_size_ind
                     right_edge = left_edge + window_size_ind
-                    ref_trace, _ = get_windowed_data(reference_waveform, 1.,min_ind=left_edge, max_ind=right_edge, apply_detrend=True,taper=taper,pad=pad)
+                    ref_trace, _ = get_windowed_data(ref, 1.,min_ind=left_edge, max_ind=right_edge, apply_detrend=True,taper=taper,pad=pad)
                     stretch_trace, _ = get_windowed_data(stretched_waveform, 1.,min_ind=left_edge, max_ind=right_edge, apply_detrend=True,taper=taper,pad=pad)
                                                             
                     corr = correlate(ref_trace, stretch_trace, mode='full')
@@ -461,7 +470,7 @@ def stretching_cwi(reference_waveform, times, data, min_time=0, max_time=1e6,
             i_func = interp1d(ref_times,comp_waveform)
             stretched_waveform = i_func(stretched_times)
 
-            plt.plot(times, reference_waveform, 'r-',label='Reference')
+            plt.plot(times, ref, 'r-',label='Reference')
             plt.plot(times, stretched_waveform, 'b-',label='Stretched Query')
             plt.xlabel('Time ($\mu$s)'); plt.ylabel('Amplitude')
             plt.legend(); plt.title('Best stretching factor: {}%'.format(time_lag*100.))

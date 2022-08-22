@@ -244,7 +244,8 @@ def create_colorbar(fig, ax, color_key, color_label, color_data,
 
 def pump_dv_plot(dp_object, velocity_changes, pump_bandpass=None, normed_pump=True, 
                 milliseconds=False, fig=None, figsize=(10,7), show=True, 
-                ylab='Velocity Change (\%)', **kwargs):
+                ylab='Velocity Change (\%)', plot_pump_strain=False, 
+                freq=0., sample_length=1., vel_ylim=None, plot_times_on_x=True, **kwargs):
     '''
     Make a typical DAET plot showing the pump oscillation
     in the top panel and the change in velocity in the
@@ -261,6 +262,12 @@ def pump_dv_plot(dp_object, velocity_changes, pump_bandpass=None, normed_pump=Tr
         --figsize: The size of the Figure
         --show: True to show the plot
         --ylab: The y-axis label for the velocity change axis
+        --plot_pump_strain: True to plot strain on the y axis
+        --freq: The frequency of the pump signal.
+        --sample_length: The length of the sample
+        --vel_ylim: Y limits for the velocity axis
+        --plot_times_on_x: True to plot the pump times on the x axis, 
+                False to plot based on probe index
         --kwargs: The keyword arguments for plotting (see format_fig)
 
     Returns:
@@ -278,16 +285,22 @@ def pump_dv_plot(dp_object, velocity_changes, pump_bandpass=None, normed_pump=Tr
         ax1, ax2 = axes[0], axes[1]
 
     times = dp_object.pump_signal_times.copy()
-    pump = dp_object.pump_signal.copy()[0]
+    pump = dp_object.pump_signal.copy()
 
     if normed_pump:
         pump = pump/np.amax(np.abs(pump))
     if pump_bandpass:
         pump = dp_object._bandpass_filter(pump, pump_bandpass[0], pump_bandpass[1], dp_object.virtual_sampling_rate)
-    pump = ss.detrend(pump,type='constant')
 
-    ax1.plot(times, pump, label='Pump', color='blue')
-    ax2.plot(times, velocity_changes, label='Cross Correlation')
+    if plot_pump_strain:
+        pump = pump / (2*np.pi*freq) / sample_length * 1e6
+
+    if plot_times_on_x:
+        ax1.plot(times, pump, label='Pump', color='blue')
+        ax2.plot(times, velocity_changes, label='Cross Correlation')
+    else:
+        ax1.plot(pump, label='Pump', color='blue')
+        ax2.plot(velocity_changes, label='Cross Correlation')        
 
     x_lab = 'Time (s)'
     if milliseconds:
@@ -298,11 +311,36 @@ def pump_dv_plot(dp_object, velocity_changes, pump_bandpass=None, normed_pump=Tr
     if normed_pump:
         ylim=(-1.1,1.1)
         pump_ylab= 'Amplitude (a.u.)'
+    elif plot_pump_strain:
+        pump_ylab= 'Amplitude (microstrain)'
 
     fig,ax1 = format_fig(fig, ax1, xlab='', ylab=pump_ylab, show=False, ylim=ylim, **kwargs)
-    fig,ax2 = format_fig(fig, ax2, xlab=x_lab, ylab=ylab, show=show, **kwargs)
+    fig,ax2 = format_fig(fig, ax2, xlab=x_lab, ylab=ylab, show=show, ylim=vel_ylim, **kwargs)
 
     return fig, [ax1, ax2]
+
+def bowtie_plot(pump_wave, velocity_changes, plot_strain=True, freq=1.,
+                sample_length=1, figsize=(8,8), integrate_pump_wave=True,
+                **kwargs):
+    """
+    Function to make a bowite-type plot from a single
+    cycle of a pump wave and the corresponding change
+    in velocity
+    """
+
+    fig=plt.figure(figsize=figsize)
+
+    xlab = "Displacement (nm)"
+    if plot_strain:
+        pump_wave = pump_wave / (2*np.pi*freq) / sample_length * 1e6
+        xlab = "Microstrain"
+
+    plt.plot(pump_wave, velocity_changes, 'ro', markersize=5)
+    plt.grid(ls=":")
+    plt.axhline(0,ls='--',color='k')
+    plt.axvline(0,ls='--',color='k')
+    
+    format_fig(fig, plt.gca(), xlab=xlab, ylab="Velocity Change (\%)",**kwargs)
 
 
 def animated_probe_waveforms(dp_object, reference_waveform=None, update_interval=0.2, 
@@ -351,7 +389,7 @@ def animated_probe_waveforms(dp_object, reference_waveform=None, update_interval
     ax1 = fig.add_subplot(gs[0, :])
     ax2 = fig.add_subplot(gs[1:, :])
 
-    pump = dp_object.pump_signal.copy()[0]
+    pump = dp_object.pump_signal.copy()
     pump = pump/np.amax(np.abs(pump))
     if pump_bandpass:
         pump = dp_object._bandpass_filter(pump, pump_bandpass[0], pump_bandpass[1], dp_object.virtual_sampling_rate)
@@ -364,14 +402,15 @@ def animated_probe_waveforms(dp_object, reference_waveform=None, update_interval
     ax1.plot(pump_times, pump, label='LF Pump', color='blue')
     pump_marker = ax1.axvline(0.,color='k',alpha=0.7,lw=0.7)
 
-    data = dp_object.probe_data[0].copy()
-    orig_times = dp_object.probe_times*1e6
+    
+    data = dp_object.probe_data.copy()
+    orig_times = dp_object.probe_times.copy()*1e6
     data, times = signal_processing(dp_object, data, orig_times, time_limits=xlim, sampling_rate=dp_object.sampling_rate,**kwargs)
-    reference_waveform, _ = signal_processing(dp_object, reference_waveform, orig_times, time_limits=xlim, \
+    reference_waveform, ref_times = signal_processing(dp_object, reference_waveform, orig_times, time_limits=xlim, \
                                                         sampling_rate=dp_object.sampling_rate, **kwargs)
 
-    num_updates = dp_object.probe_data.shape[1]
-    ax2.plot(times, reference_waveform, color='gray', alpha=0.5, label='Probe Reference')
+    num_updates = dp_object.probe_data.shape[0]
+    ax2.plot(ref_times, reference_waveform, color='gray', alpha=0.5, label='Probe Reference')
     current_probe=None
 
     anim = animation.FuncAnimation(fig, update, interval=update_interval*1000, save_count=num_updates,
@@ -390,7 +429,8 @@ def animated_probe_waveforms(dp_object, reference_waveform=None, update_interval
     return fig
 
 def signal_processing(dp_object, data, times, sampling_rate=None, bandpass=None,
-                    time_limits=None, normalise=False, detrend=False, demean=False, **kwargs):
+                    time_limits=None, normalise=False, detrend=False, demean=False, 
+                    smoothing_amount=0, **kwargs):
     '''
     Routines for signal processing to prepare the data for 
     plotting
@@ -405,6 +445,10 @@ def signal_processing(dp_object, data, times, sampling_rate=None, bandpass=None,
         --detrend: True to detrend the probe waveform data
         --demean: True to demean the waveforms
         --time_limits: A tuple of (min_time,max_time) to trim the data
+        --smoothing_amount: An integer which specifies a number
+            of probe waveforms to average before doing the cross
+            correlation at each posiiton. Only previous waveforms
+            will be averaged with the current waveform.
         --kwargs: Placeholder for kwargs to be used in future routines
 
     Returns:
@@ -418,7 +462,7 @@ def signal_processing(dp_object, data, times, sampling_rate=None, bandpass=None,
         min_ind = np.argmin(np.abs(times - time_limits[0]))
         max_ind = np.argmin(np.abs(times - time_limits[1]))
         data = data[...,min_ind:max_ind+1]
-        times = times[min_ind:max_ind+1]
+        times = times.copy()[min_ind:max_ind+1]
     if detrend:
         data = ss.detrend(data)
     if demean:
@@ -426,6 +470,22 @@ def signal_processing(dp_object, data, times, sampling_rate=None, bandpass=None,
     if normalise:
         maxes = np.amax(np.abs(data),axis=-1)
         data = np.divide(data.transpose(),maxes).transpose()
+    if smoothing_amount:
+        if type(smoothing_amount) == type((1,)):
+            break_indices = [0]+list(smoothing_amount[1:])+[data.shape[0]]
+            smoothing_amount = smoothing_amount[0]
+            next_break_ind = 1
+            for i in range(data.shape[0]):
+                data[i] = np.average(data[max(break_indices[next_break_ind-1],i+1-smoothing_amount):i+1],axis=0)
+                if next_break_ind<len(break_indices) and i == break_indices[next_break_ind]-1:
+                    next_break_ind += 1
+        else:
+            for i in range(data.shape[0]):
+                data[i] = np.average(data[max(0,i+1-smoothing_amount):i+1],axis=0)
+
+    #plt.plot(times,trace50/np.amax(trace50),'r-')
+    #plt.plot(times, trace501/np.amax(trace501))
+    #plt.show()
 
     return data, times
 
