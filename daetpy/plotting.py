@@ -6,6 +6,7 @@ Jonathan Simpson, April 2020
 
 import numpy as np
 import scipy.signal as ss
+from scipy.integrate import cumtrapz
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -242,18 +243,20 @@ def create_colorbar(fig, ax, color_key, color_label, color_data,
     return fig, ax
 
 
-def pump_dv_plot(dp_object, velocity_changes, pump_bandpass=None, normed_pump=True, 
-                milliseconds=False, fig=None, figsize=(10,7), show=True, 
-                ylab='Velocity Change (\%)', plot_pump_strain=False, 
+def pump_dv_plot(dp_object, velocity_changes, pump_signal=None,pump_bandpass=None, normed_pump=True, 
+                milliseconds=False, fig=None, figsize=(10,7), show=True, pump_ylab='Amplitude (mm/s)',
+                ylab='Velocity Change (\%)', plot_pump_strain=False, separate_panels=True,
                 freq=0., sample_length=1., vel_ylim=None, plot_times_on_x=True, **kwargs):
     '''
     Make a typical DAET plot showing the pump oscillation
     in the top panel and the change in velocity in the
-    second panel.
+    second panel (or on the same axis).
 
     Arguments:
         --dp_object: The DaetPy object
         --velocity_changes: The velocity variations
+        --pump_signal: The pump signal to plot. If not given, the pump
+            signal will be taken from the dp object
         --pump_bandpass: A bandpass filter to apply to the pump
             signal, given as (min_freq, max_freq)
         --normed_pump: True to normalise the pump amplitudes
@@ -263,6 +266,8 @@ def pump_dv_plot(dp_object, velocity_changes, pump_bandpass=None, normed_pump=Tr
         --show: True to show the plot
         --ylab: The y-axis label for the velocity change axis
         --plot_pump_strain: True to plot strain on the y axis
+        --separate_panels: True to plot the pump and velocity dv on spearate panels.
+            If False, the pump and vel dv will be plotted n the same panel.
         --freq: The frequency of the pump signal.
         --sample_length: The length of the sample
         --vel_ylim: Y limits for the velocity axis
@@ -278,14 +283,21 @@ def pump_dv_plot(dp_object, velocity_changes, pump_bandpass=None, normed_pump=Tr
     if not fig:
         fig = plt.figure(figsize=figsize)
         gs = fig.add_gridspec(3, 1,hspace=0.4)
-        ax1 = fig.add_subplot(gs[0, :])
-        ax2 = fig.add_subplot(gs[1:, :],sharex=ax1)
+        if separate_panels:
+            ax1 = fig.add_subplot(gs[0, :])
+            ax2 = fig.add_subplot(gs[1:, :],sharex=ax1)
+        else:
+            ax1 = fig.add_subplot(111)
+            ax2 = ax1.twinx()
     else:
         axes = fig.axes
         ax1, ax2 = axes[0], axes[1]
 
-    times = dp_object.pump_signal_times.copy()
-    pump = dp_object.pump_signal.copy()
+    if str(pump_signal) == "None":
+        times = dp_object.pump_signal_times.copy()
+        pump = dp_object.pump_signal.copy()
+    else:
+        pump = pump_signal
 
     if normed_pump:
         pump = pump/np.amax(np.abs(pump))
@@ -293,21 +305,22 @@ def pump_dv_plot(dp_object, velocity_changes, pump_bandpass=None, normed_pump=Tr
         pump = dp_object._bandpass_filter(pump, pump_bandpass[0], pump_bandpass[1], dp_object.virtual_sampling_rate)
 
     if plot_pump_strain:
-        pump = pump / (2*np.pi*freq) / sample_length * 1e6
+        pump = pump / sample_length * 1e6
 
     if plot_times_on_x:
-        ax1.plot(times, pump, label='Pump', color='blue')
-        ax2.plot(times, velocity_changes, label='Cross Correlation')
+        ax1.plot(times, pump, label='Pump Strain', color='blue')
+        ax2.plot(times, velocity_changes, label='Velocity Change')
     else:
         ax1.plot(pump, label='Pump', color='blue')
-        ax2.plot(velocity_changes, label='Cross Correlation')        
+        ax2.plot(velocity_changes, label='Velocity Change')        
 
     x_lab = 'Time (s)'
     if milliseconds:
         x_lab = 'Time (ms)'
+    if not plot_times_on_x:
+        x_lab = 'Probe number'
 
     ylim=None
-    pump_ylab = 'Amplitude ({})'.format(dp_object.pump_label)
     if normed_pump:
         ylim=(-1.1,1.1)
         pump_ylab= 'Amplitude (a.u.)'
@@ -319,29 +332,61 @@ def pump_dv_plot(dp_object, velocity_changes, pump_bandpass=None, normed_pump=Tr
 
     return fig, [ax1, ax2]
 
-def bowtie_plot(pump_wave, velocity_changes, plot_strain=True, freq=1.,
-                sample_length=1, figsize=(8,8), integrate_pump_wave=True,
-                **kwargs):
+def bowtie_plot(pump_wave, velocity_changes, plot_strain=True, plot_strain_rate=False,freq=1.,direction_markers=None,
+                sample_length=1, figsize=(8,8), integrate_pump_wave=False,color=None,probes_per_pump_cycle=100,
+                fig=None, label=None,xlab="Microstrain", ylab="Velocity Change (\%)",compression_labels=False,ylim=None,
+                ls='',**kwargs):
     """
     Function to make a bowite-type plot from a single
     cycle of a pump wave and the corresponding change
     in velocity
     """
 
-    fig=plt.figure(figsize=figsize)
+    if not fig:
+        fig=plt.figure(figsize=figsize)
 
-    xlab = "Displacement (nm)"
     if plot_strain:
-        pump_wave = pump_wave / (2*np.pi*freq) / sample_length * 1e6
-        xlab = "Microstrain"
-
-    plt.plot(pump_wave, velocity_changes, 'ro', markersize=5)
-    plt.grid(ls=":")
-    plt.axhline(0,ls='--',color='k')
-    plt.axvline(0,ls='--',color='k')
+        pump_wave = pump_wave / sample_length * 1e6 * -1. # Compression is negative, tension in positive. (2*np.pi*freq) 
+    elif plot_strain_rate:
+        pump_wave = np.gradient(pump_wave / sample_length * 1e6 * -1.) # Compression is negative, tension in positive.
     
-    format_fig(fig, plt.gca(), xlab=xlab, ylab="Velocity Change (\%)",**kwargs)
+    if integrate_pump_wave:
+        av_pump_times = np.arange(len(pump_wave))*1/(freq*probes_per_pump_cycle)
+        int_signal = ss.detrend(cumtrapz(pump_wave,x=av_pump_times),type='constant')
+        pump_wave = np.concatenate(([(int_signal[0]+int_signal[-1])/2],int_signal))
+        plt.plot(pump_wave)
+        plt.title("Integrated pump wave")
+        plt.show()
 
+    if direction_markers != None:
+        extended_pump, extended_vels = np.tile(pump_wave,3), np.tile(velocity_changes,3)
+        min_i, max_i = np.argmin(extended_pump), np.argmax(extended_pump)
+        if min_i > max_i:
+            print('ok1')
+            dec_strain, dec_vels = extended_pump[max_i:min_i], extended_vels[max_i:min_i]
+            inc_strain, inc_vels = extended_pump[min_i:max_i+len(pump_wave)], extended_vels[min_i:max_i+len(pump_wave)]
+        else:
+            print('ok2')
+            inc_strain, inc_vels = extended_pump[min_i:max_i], extended_vels[min_i:max_i]
+            dec_strain, dec_vels = extended_pump[max_i:min_i+len(pump_wave)], extended_vels[max_i:min_i+len(pump_wave)]
+        inc_line = plt.plot(inc_strain, inc_vels, markersize=5, label=label, marker=direction_markers[0],ls=ls,color=color,zorder=5)[0]
+        dec_line = plt.plot(dec_strain, dec_vels, markersize=5, label=label, marker=direction_markers[1],ls=ls,color=color,zorder=5)[0]
+    else:
+        lines = plt.plot(list(pump_wave)+[pump_wave[0]], list(velocity_changes)+[velocity_changes[0]], markersize=5, label=label, marker='o',ls='',color=color,zorder=5)#, ls='-')
+    plt.grid(ls=":")
+
+    plt.axhline(0,ls='--',color='gray',zorder=1)
+    plt.axvline(0,ls='--',color='gray',zorder=1)
+
+    if compression_labels:
+        y_range = max(0.,max(velocity_changes))-min(velocity_changes)
+        plt.text(max(pump_wave),min(velocity_changes)*1.03,"Dilation",ha="right",va="top",fontsize=15)  #-0.03*y_range
+        plt.text(min(pump_wave),min(velocity_changes)*1.03,"Compression",ha="left",va="top",fontsize=15)
+        ylim = (min(velocity_changes)-0.08*y_range,max(velocity_changes)+0.05*y_range)
+    
+    format_fig(fig, plt.gca(), xlab=xlab, ylim=ylim, ylab=ylab ,**kwargs)
+
+    return fig
 
 def animated_probe_waveforms(dp_object, reference_waveform=None, update_interval=0.2, 
                 pump_bandpass=None, pump_milliseconds=True, xlim=None, repeat_delay=0., 

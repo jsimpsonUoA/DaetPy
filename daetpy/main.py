@@ -13,6 +13,8 @@ import json
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
+from scipy.interpolate import interp1d
+from scipy.integrate import cumtrapz
 
 import warnings
 from scipy.signal import iirfilter, zpk2sos, sosfiltfilt, correlate, detrend
@@ -22,11 +24,12 @@ from daetpy.plotting import format_fig
 
 
 class DaetPy():
-    def __init__(self, directory, pump_freq, probe_pulse_per_cycle, pump_index=0, probe_index=1, 
+    def __init__(self, directory, pump_freq, probe_pulse_per_cycle,pump_index=0, probe_index=1, 
             pump_channel='CHANNEL_A',probe_channel='CHANNEL_B',scan_name=None, data_filename=None,
             pump_sensor='PolytecOFV5000X', probe_sensor='PolytecOFV5000', reconstruct_exp=True, 
             pump_min_time=-1e6, pump_max_time=1e6, pump_bandpass=None,fit_pump_sinusoid=False,
-            correct_pump_offset=True,use_pump_fitted_curve=False,reference_min_ind=0,reference_max_ind=10):
+            correct_pump_offset=True,use_pump_fitted_curve=False,reference_min_ind=0,reference_max_ind=10,
+            pump_preamp_gain=1):
         '''
         DaetPy is a class designed for handling, processing, and analysing
         Dynamic-Acoustoelastic Testing experiments recorded using PLACE.
@@ -48,6 +51,8 @@ class DaetPy():
         self.reference_t0 = 1.0
         self.reference_min_ind = reference_min_ind
         self.reference_max_ind = reference_max_ind
+        self.pump_start_index = 0
+        self.pump_stop_index = -1
 
         if not scan_name:
             self.scan_name = directory[directory[:-1].rfind('/')+1:-1]
@@ -95,13 +100,13 @@ class DaetPy():
 
         self.pump_signal, self.pump_signal_times, self.virtual_sampling_rate = \
             self.construct_pump_signal(min_time=pump_min_time,max_time=pump_max_time,
-                                bandpass=pump_bandpass,fit_pump_sinusoid=fit_pump_sinusoid,
+                                bandpass=pump_bandpass,fit_pump_sinusoid=fit_pump_sinusoid,pump_preamp_gain=pump_preamp_gain,
                                 correct_pump_offset=correct_pump_offset,use_pump_fitted_curve=use_pump_fitted_curve)
 
 
     def construct_pump_signal(self, min_time=-1e6, max_time=1e6, bandpass=None,
                                 fit_pump_sinusoid=False,correct_pump_offset=True,
-                                use_pump_fitted_curve=False):
+                                use_pump_fitted_curve=False,pump_preamp_gain=1):
         '''
         This method constructs the DAET pump signal by taking
         the average values of the pump_data at each probe shot
@@ -123,22 +128,29 @@ class DaetPy():
         '''
 
         dat = self.pump_data.copy()
+        dat /= pump_preamp_gain
         if bandpass:
             dat = self._bandpass_filter(dat, bandpass[0], bandpass[1], self.sampling_rate)
 
         if fit_pump_sinusoid:
             f = lambda x,a,c,d:a*np.sin(2*np.pi*self.pump_freq*x+c)+d
             for i in range(len(dat)):
-                fit, _ = curve_fit(f, self.pump_times, dat[i], p0=(0,0,0))
+                try:
+                    fit, _ = curve_fit(f, self.pump_times, dat[i], p0=(0,0,0))
+                except RuntimeError:
+                    print("Curve fit didn't find optimal parameters. Using (0,0,0)")
+                    fit = [0,0,0]
                 if i%100 == 0:
+                    print(self.pump_times[300])
                     plt.plot(self.pump_times, dat[i])
                     plt.plot(self.pump_times,f(self.pump_times,fit[0],fit[1],fit[2]))
+                    plt.plot(self.pump_times,np.gradient(f(self.pump_times,fit[0],fit[1],fit[2]),self.pump_times)/(2*np.pi*self.pump_freq)**2)
                     plt.title("Result of pump signal fitting")
                     plt.show()
                 if correct_pump_offset:
                     dat[i] = dat[i] - fit[-1]
                 elif use_pump_fitted_curve:
-                    dat[i] = f(self.pump_times,fit[0],fit[1],0) 
+                    dat[i] = f(self.pump_times,fit[0],fit[1],fit[2]) 
 
         min_ind = np.where(self.pump_times >= min_time)[0][0]
         max_ind = np.where(self.pump_times <= max_time)[0][-1]
@@ -187,9 +199,9 @@ class DaetPy():
         return reference
 
 
-    def compute_time_delays(self, reference_waveform, bandpass=None,  normalise=False, min_probe_index=0,
+    def compute_time_delays(self, reference_waveform, trace_bandpass=None,  normalise=False, min_probe_index=0,
                             min_probe_time=False, tmin=0., tmax=50., smoothing_amount=0, 
-                            parabolic_approx=True):
+                            parabolic_approx=True,lags_bandpass=None):
         '''
         Function which computes the time delays from the
         DAET probe signals. Positive lag menas the sample
@@ -200,7 +212,8 @@ class DaetPy():
         Arguments:
             --reference_waveform: A reference waveform to compare probe
                 waveforms to. See generate_reference_waveform
-            --bandpass: A bandpass filter applied to the probe waveforms
+            --trace_bandpass: A bandpass filter applied to the probe waveforms before 
+              cross correlation
             --normalise: True to normalise the probe waveforms before comparison
             --min_probe_index: The index of the probe waveforms to start
                 comparing with the reference
@@ -222,6 +235,9 @@ class DaetPy():
                 three points of the cross correlation, rather than using 
                 the time at the maximum as the delay (see Cespedes, 1995, 
                 Ultrasonic Imaging).
+            --lags_bandpass: A bandpass filter applied to the lags after all
+              lags have been computed. The pump_signals_times is used to determine
+              the sampling rate here.
 
         Returns:
             --lags: The time delays, front-padded to match the shape of
@@ -229,9 +245,9 @@ class DaetPy():
         '''
 
         probe_data = self.probe_data.copy()
-        if bandpass:
-            probe_data = self._bandpass_filter(probe_data, bandpass[0], bandpass[1], self.sampling_rate)
-        if min_probe_time != None:
+        if trace_bandpass:
+            probe_data = self._bandpass_filter(probe_data, trace_bandpass[0], trace_bandpass[1], self.sampling_rate)
+        if min_probe_time != False:
             min_probe_index = np.where(self.pump_signal_times >= tmin / 1e6)[0][0]
         
         probe_data = detrend(probe_data)
@@ -283,9 +299,150 @@ class DaetPy():
 
         lags = np.concatenate((np.array([0.]*min_probe_index),lags)) * -1.
 
+        if lags_bandpass:
+            lags = self._bandpass_filter(lags, lags_bandpass[0], lags_bandpass[1], 1/np.diff(self.pump_signal_times)[0])
+            lags = lags - np.average(lags[self.reference_min_ind:self.reference_max_ind+1])
+
+
         return lags    
 
-    def average_probe_over_pump_cycle(self,min_index=0,max_index=-1, min_cycle_length=10):
+    def pick_pump_start_stop(self):
+        """
+        Function to plot the pump signal so that
+        the times when the pump starts and stops
+        can be picked
+        """
+
+        global pick_line1, pick_line2, active_line
+
+        def key_press(self, event, fig):
+
+            global pick_line1, pick_line2, active_line
+            pick = event.xdata
+            if pick != None:
+                if active_line == 1:
+                    self.pump_start_index = int(round(pick))
+                    active_line = 2
+                    if pick_line1 != None:
+                        pick_line1.remove() 
+                    pick_line1 = plt.axvline(x=pick,color='r',ls='--',lw=1.)
+                elif active_line == 2:
+                    self.pump_stop_index = int(round(pick))
+                    active_line = 1
+                    if pick_line2 != None:
+                        pick_line2.remove() 
+                    pick_line2 = plt.axvline(x=pick,color='b',ls='--',lw=1.)
+                fig.canvas.draw()
+
+        fig = plt.figure(figsize=(8,5))
+        plt.plot(self.pump_signal)
+        plt.axhline(0.,ls="--",color="gray")
+        plt.title('Hover mouse over start and end of pump to pick and press any key. Close to save picks.')
+
+        pick_line1, pick_line2, active_line = None, None, 1
+        fig.canvas.mpl_disconnect(fig.canvas.manager.key_press_handler_id)
+        fig.canvas.mpl_connect('key_press_event', lambda event: key_press(self, event, fig))         
+    
+        fig, ax = format_fig(fig, plt.gca(),ylab='Amplitude',xlab='Index')
+
+        plt.show()
+
+        return self.pump_start_index, self.pump_stop_index
+
+    def pump_signal_bandpass(self, bandpass, sampling_rate=1, modify_dp_pump=True, 
+                            pump_signal=None, start_ind=0,stop_ind=-1):
+        """
+        Apply a bandpass filter to a pump signal after
+        it has been constructed.
+
+        Arguments:
+          --bandpass: The bandpass filter as a tuple (low_freq,high_freq)
+          --samping_rate: The sampling rate of the data. If modify_dp_pump
+            is True, then the pump_signal_times will determine this.
+          --modify_dp_pump: If True, apply the bandpass filter to
+            the pump_signal that is already assigned to this DaetPy object.
+            This reassigns the filtered pump signal to self.pump_signal
+          --pump_signal: If modify_dp_pump is False, this is the pump signal
+            to filter
+          --start_ind: The starting index of the pump
+          --stop_ind: The stop index of the pump.
+        """
+
+        if modify_dp_pump:
+            dat = self.pump_signal.copy()
+            samp = 1/np.diff(self.pump_signal_times)[0]
+        else:
+            dat = pump_signal
+            samp = sampling_rate
+
+        if bandpass:
+            pump_on = dat[start_ind:stop_ind]
+
+            #before_filter = self._bandpass_filter(dat[:start_ind],bandpass[0],bandpass[1],samp)
+            #pump_filter = self._bandpass_filter(pump_on,bandpass[0],bandpass[1],samp)
+            #after_filter = self._bandpass_filter(dat[stop_ind:],bandpass[0],bandpass[1],samp)
+            #filtered_dat = np.concatenate((before_filter,pump_filter,after_filter))
+            
+            filtered_dat = self._bandpass_filter(dat,bandpass[0],bandpass[1],samp)
+            filtered_dat = filtered_dat - np.average(filtered_dat[self.reference_min_ind:self.reference_max_ind+1])
+
+            if modify_dp_pump:
+                self.pump_signal = filtered_dat
+
+            return filtered_dat
+        return dat
+
+
+    def compute_all_pumps(self,start_pump_ind, stop_pump_ind, sample_length,
+                    min_cycle_length=5, original_pump_type='vel'):
+        """
+        Compute the different types of pump signals.
+        This function computes and returns the pump
+        signal representing particle velocity, particle
+        displacement, strain, and strain rate.
+        
+        Arguments:
+          --start_pump_ind: The index where the pump turns on
+          --stop_pump_ind: The index where the pump turns off 
+          --min_cycle_length: The minimum numbers of indices in
+              one pump cycle
+          --sample_length: The length of the sample (in mm)
+          --original_pump_type: The type specifier for the raw
+              pump. 'vel' if it represents particle velocity,
+              and 'displ' if it represents particle displacement.
+
+        Returns:
+          --pump_displ: The particle displacement pump
+          --pump_vel: The particle velocity pump
+          --pump_strain: The strain pump (note this is phase-corrected)
+          --pump_strain_rate: The strain rate pump
+        """
+
+        #av_pump, av_probes, av_cycle_length = self.average_probe_over_pump_cycle(
+        #        start_pump_ind, stop_pump_ind,min_cycle_length=min_cycle_length,integrate_pump_wave=False)
+
+        sliced_original = self.pump_signal.copy()[start_pump_ind:stop_pump_ind]
+        so_len = len(sliced_original)
+        cos_func = lambda x, a, w, p: a*np.cos(w*x+p)
+        fit, cov = curve_fit(cos_func, range(so_len),sliced_original,p0=(np.amax(sliced_original),2*np.pi/50,0))
+        plt.plot(sliced_original)
+        plt.plot(range(so_len),cos_func(range(so_len),*fit))
+        plt.plot(np.diff(sliced_original))
+        plt.show()
+
+        plt.plot(self.pump_data.copy()[120],'b-')
+        plt.plot(np.diff(self.pump_data.copy())[120],'r-')
+        plt.show()
+        
+        return
+
+        if original_pump_type == 'vel':
+            pump_vel = self.pump_signal.copy()
+        elif original_pump_type == 'displ':
+            pump_displ = self.pump_signal.copy()
+
+    def average_probe_over_pump_cycle(self,min_index=0,max_index=-1, min_cycle_length=10,
+                                        integrate_pump_wave=True):
         """
         This function is designed to improve the S/N of
         the probe waveforms before velocity analysis. It
@@ -303,10 +460,17 @@ class DaetPy():
               average to
           --min_cycle_length: The minimum number of indices that
               one period of the pump should be.
+          --integrate_pump_wave: If True, then the final averaged pump
+              wave will be "integrated". This assumes that the 
+              pump is recording velocity. Integration is achieved by
+              a cumulative trapezoidal sum, and the resulting values
+              are in mm (assuming velocity was mm/s)
 
         Return:
           --av_pump: Average pump cycle
           --av_probe: The averaged probe signals
+          --av_cycle_length: The average number of indices
+            in one pump cycle.
 
         """
 
@@ -326,21 +490,109 @@ class DaetPy():
         av_pump = np.zeros(av_cycle_length)
         av_probes = np.zeros((av_cycle_length,self.probe_data.shape[-1]))
         for start_ind in cycle_start_inds[:-1]:
-            single_pump_cycle = pump[start_ind:start_ind+av_cycle_length]
-            probe_set = self.probe_data[start_ind+min_index:start_ind+min_index+av_cycle_length,:]
-            av_pump = av_pump + single_pump_cycle
-            av_probes = av_probes + probe_set
+            if start_ind+av_cycle_length<len(pump):
+                single_pump_cycle = pump[start_ind:start_ind+av_cycle_length]
+                probe_set = self.probe_data[start_ind+min_index:start_ind+min_index+av_cycle_length,:]
+                av_pump = av_pump + single_pump_cycle
+                av_probes = av_probes + probe_set
 
-            plt.plot(single_pump_cycle)
+                plt.plot(single_pump_cycle)
         plt.show()
 
         av_pump = av_pump / (len(cycle_start_inds)-1)
         av_probes = av_probes / (len(cycle_start_inds)-1)
 
+        if integrate_pump_wave:
+            av_pump_times = self.pump_signal_times.copy()[:len(av_pump)]
+            int_signal = detrend(cumtrapz(av_pump,x=av_pump_times),type='constant')
+            av_pump = np.concatenate(([(int_signal[0]+int_signal[-1])/2],int_signal))
+            # Deprecated (and wrong!)
+            #end_part = av_pump[int(0.75*len(av_pump)):]
+            #av_pump = np.concatenate((end_part,av_pump[:-len(end_part)]))
+
         plt.plot(av_pump)
         plt.show()    
 
-        return av_pump, av_probes
+        return av_pump, av_probes, av_cycle_length
+
+    def average_lags_over_pump_cycle(self,lags,min_index=0,max_index=-1, min_cycle_length=10,
+                                        integrate_pump_wave=True,show_plots=True):
+        """
+        This function is designed to improve the S/N of
+        the lags after velocity analysis. It
+        does this by splitting up the pump into individual
+        cycles, and then averaging both the lags
+        and the pump signal across those cycles. This
+        assumes that the velocity variation is the same 
+        across all pump cycles, and that all pump cycles
+        are the same too.
+
+        Arguments:
+          --lags: The unaveraged lags arrays. Same length as self.pump_signal
+          --min_index: The minimum index in the pump signal to
+              average from
+          --max_index: The maximum index in the pump signal to
+              average to
+          --min_cycle_length: The minimum number of indices that
+              one period of the pump should be.
+          --integrate_pump_wave: If True, then the final averaged pump
+              wave will be "integrated". This assumes that the 
+              pump is recording velocity. Integration is achieved by
+              a cumulative trapezoidal sum, and the resulting values
+              are in mm (assuming velocity was mm/s)
+          --show_plots: True to show monitoring plots.
+
+        Return:
+          --av_pump: Average pump cycle
+          --av_lags: The averaged lags
+          --av_cycle_length: The average number of indices
+            in one pump cycle.
+
+        """
+
+        pump = self.pump_signal.copy()[min_index:max_index]
+
+        cycle_start_inds = []
+        current_sign = round(pump[0]/abs(pump[0]))
+        for i in range(len(pump)):
+            new_sign = round(pump[i]/abs(pump[i]))
+            if new_sign == 1 and current_sign == -1:
+                if len(cycle_start_inds) == 0 or (i-cycle_start_inds[-1])>min_cycle_length:
+                    cycle_start_inds.append(i)
+            current_sign = new_sign
+            
+        av_cycle_length = int(np.average(np.diff(cycle_start_inds)))
+
+        av_pump = np.zeros(av_cycle_length)
+        av_lags = np.zeros(av_cycle_length)
+        for start_ind in cycle_start_inds[:-1]:
+            if start_ind+av_cycle_length<len(pump):
+                single_pump_cycle = pump[start_ind:start_ind+av_cycle_length]
+                cycle_lags = lags[start_ind+min_index:start_ind+min_index+av_cycle_length]
+                av_pump = av_pump + single_pump_cycle
+                av_lags = av_lags + cycle_lags
+
+                if show_plots:
+                    plt.plot(single_pump_cycle)
+        if show_plots:
+            plt.show()
+
+        av_pump = av_pump / (len(cycle_start_inds)-1)
+        av_lags = av_lags / (len(cycle_start_inds)-1)
+
+        if integrate_pump_wave:
+            av_pump_times = self.pump_signal_times.copy()[:len(av_pump)]
+            int_signal = detrend(cumtrapz(av_pump,x=av_pump_times),type='constant')
+            av_pump = np.concatenate(([(int_signal[0]+int_signal[-1])/2],int_signal))
+            # Deprecated (and wrong!)
+            #end_part = av_pump[int(0.75*len(av_pump)):]
+            #av_pump = np.concatenate((end_part,av_pump[:-len(end_part)]))
+
+        if show_plots:
+            plt.plot(av_pump)
+            plt.show()    
+
+        return av_pump, av_lags, av_cycle_length
 
 
     def pick_reference_t0(self, reference_waveform, tmin=0., tmax=30., bandpass=None):
@@ -408,13 +660,12 @@ class DaetPy():
         This currently works for Polytec modules.
         '''
 
-        
         try:
             module = self.config['plugins'][module_name]
             module_config = module['config']
 
             try:
-                decoder = [item for item in module_config.items() if item[1] == True and item[0] != "plot" ][0][0]
+                decoder = [item for item in module_config.items() if item[1] == True and item[0] != "plot" and item[0] != "autofocus_everytime"][0][0]
                 _range_s = [item for item in module_config.items() if decoder+'_range' in item[0]][0][1]
                 first_ndig = next((s for s in _range_s if s not in ['0','1','2','3','4','5','6','7','8','9','.']), _range_s[-1])
                 _range = _range_s[:_range_s.find(first_ndig)]

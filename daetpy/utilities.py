@@ -8,10 +8,13 @@ University of Auckland, 2020.
 
 import numpy as np
 import matplotlib.pyplot as plt
+import warnings
+import time
 
 from scipy.signal import correlate, detrend, resample, decimate
 from scipy.stats import linregress
 from scipy.interpolate import interp1d
+from scipy.signal import iirfilter, zpk2sos, sosfiltfilt, correlate, detrend
 
 def coda_wave_interferometry(reference_waveform, times, data, min_time=0, 
                         max_time=1e6, window_size=20, overlap=0, taper=0, pad=0,
@@ -202,6 +205,37 @@ def get_windowed_data(waveform, sampling_rate, min_ind=0, max_ind=-1,
 
     return windowed_data, window_times
 
+def get_windowed_data_2d(waveform, sampling_rate, min_ind=0, max_ind=-1, 
+                    apply_detrend=False, taper=10, pad=0):
+    '''
+    Same as get_windowed_data, but for 2D arrays where each
+    row is a waveform. See the docs for get_windowed_data
+    '''
+
+    windowed_data = waveform[:,min_ind:max_ind]
+
+    if apply_detrend:
+        windowed_data = detrend(windowed_data,type='constant')
+
+    d_len = windowed_data.shape[-1]
+    if taper > 0:
+        total_taper_points = int(taper / 100 * d_len) // 2 * 2
+        taper = np.hanning(total_taper_points)
+        total_untapered_points = d_len - total_taper_points
+        first_taper = taper[:int(total_taper_points/2)]
+        last_taper = taper[int(total_taper_points/2):]
+        mask = np.concatenate((first_taper,np.ones(total_untapered_points),last_taper))
+        windowed_data = windowed_data * np.tile(mask, (windowed_data.shape[0],1))
+
+    if pad > 0:
+        power_of_two = np.log2(d_len) // 1 + pad
+        number_pad_samples = 2**power_of_two - d_len
+        windowed_data = np.concatenate((windowed_data,np.zeros(windowed_data.shape[0],int(number_pad_samples))))
+
+    window_times = np.arange(d_len) / sampling_rate
+
+    return windowed_data, window_times
+
 
 def dtw_from_placescan(scan, min_time=0, max_time=np.inf, bandpass=None, averaging=1, **kwargs):
     """
@@ -338,9 +372,10 @@ def get_placescan_data(scan, min_time=0, max_time=np.inf, bandpass=None, averagi
     return values, plot_times
 
 
-def stretching_cwi(reference_waveform, times, data, min_time=0, max_time=1e6,
-                        num_iterations=2 ,max_stretch=0.1, num_windows=1, taper=0, pad=0, 
-                        plot_examples=False, return_all=False, different_references=False):
+def stretching_cwi(reference_waveform, times, data, min_time=0, max_time=1e6, use_optimization=True,
+                        num_iterations=2 ,max_stretch=0.1, stretch_limits=None, num_windows=1, taper=0, pad=0, 
+                        plot_examples=False, return_all=False, different_references=False,
+                        num_factors=201):
     '''
     Perform a trace-stretching type coda wave interferometry to calculate
     the relative time difference between two time series. This algorithm
@@ -367,14 +402,27 @@ def stretching_cwi(reference_waveform, times, data, min_time=0, max_time=1e6,
             1D or 2D array, where the last axis has the same length as times.
         --min_time: The minimum time to perform cwi from. This will be the 
             left edge of the window at the first window position.
-        --max_time: The maximum time to perform the cwi to. 
+        --max_time: The maximum time to perform the cwi to.
+        --use_optimization: If True, an optimised algorithm is used to find
+            the best stretching factor for each waveform. This will significantly
+            speed up the computation time, but it assumes that the function
+            of correlation coefficient versus stretching factor is an inverted 
+            parabola and has a single global maximum within the given range 
+            of stretching factors. If False, then the cross correlation is 
+            calculated for every possible stretching factor, and then the 
+            maximum correlation coefficient is found.
         --num_iterations: The number of times to perform the stretch factor
             search. Each time, the search increment decreases by a factor
             of 20 and is re-centred around the previous iteration's best
             stretch factor.
         --max_stretch: The absolute value of the maximum stretching factor
             to search for. I.e. stretch facotrs of 1 - max_stretch to
-            1 + max_stretch will be searched.
+            1 + max_stretch will be searched. Specified as a decimal number,
+            not a percentage. Note that this is overriden if
+            stretch_limits is specified.
+        --stretch_limits: A two-element tuple specifying the lower and upper
+            stretching limits. I.e. stretch factors of 1+lower_bound to
+            1+upper bound will be searched. Overrides max_stretch.        
         --num_windows: The number of windows to independently calculate the 
                 stretching factor for
         --taper: A percentage betewen 0 and 100 specifying how much of the
@@ -388,6 +436,7 @@ def stretching_cwi(reference_waveform, times, data, min_time=0, max_time=1e6,
         --different_references: True if there is a different reference for each
             waveform. In this case, reference_waveform must be the same length
             as data.
+        --num_factors: The number of stretching factors to use in each iteration
 
     Returns:
         --dt_over_t: The average fraction by which the data waveforms(s) lag
@@ -418,9 +467,14 @@ def stretching_cwi(reference_waveform, times, data, min_time=0, max_time=1e6,
     dt_std_devs = np.zeros(data.shape[0])
     all_lags = np.zeros((data.shape[0],num_windows))
 
+    all_times = 0
     for i in range(data.shape[0]):
         if i%100 == 0:
             print(i)
+            if i>0:
+                print(it_number)
+            #    plt.plot(s_factors,max_coeffs)
+            #    plt.show()
         comp_waveform = data[i]
         lags = np.zeros(num_windows)
         stretch_anchor = 0.
@@ -429,33 +483,60 @@ def stretching_cwi(reference_waveform, times, data, min_time=0, max_time=1e6,
             ref = reference_waveform[i]
         else:
             ref = reference_waveform
-
+        
+        
         for it_number in range(num_iterations):
 
-            stretch_limit = max_stretch / max(20 * it_number,1)
-            s_factors = np.linspace(stretch_anchor-stretch_limit,stretch_anchor+stretch_limit,201)
+            if stretch_limits == None:
+                lower_limit = abs(max_stretch) / max(20 * it_number,1) * -1
+                upper_limit = lower_limit * -1
+            else:
+                lower_limit = stretch_limits[0] / max(20 * it_number,1)
+                upper_limit = stretch_limits[1] / max(20 * it_number,1)
+            s_factors = np.linspace(stretch_anchor+lower_limit,stretch_anchor+upper_limit,num_factors) # Originally was 201 points
+            
+            if not use_optimization:
+                i_func = interp1d(ref_times,comp_waveform)
+                stretched_timeso = np.tile(ref_times, (len(s_factors),1)) / (1+np.repeat(s_factors,len(ref_times)).reshape(len(s_factors),len(ref_times)))
+                stretched_timeso = np.where(stretched_timeso < ref_times[-1], stretched_timeso , 0.)
+                stretched_waveformo = i_func(stretched_timeso)
 
             for j in range(num_windows):
 
-                max_coeffs = np.zeros(len(s_factors))
-                for k, s_factor in enumerate(s_factors):
-
-                    stretched_times = ref_times / (1+s_factor)
-                    stretched_times = np.where(stretched_times < ref_times[-1], stretched_times , 0.)
-                    i_func = interp1d(ref_times,comp_waveform)
-                    stretched_waveform = i_func(stretched_times)
-
-                    left_edge = min_time_ind+j*window_size_ind
-                    right_edge = left_edge + window_size_ind
-                    ref_trace, _ = get_windowed_data(ref, 1.,min_ind=left_edge, max_ind=right_edge, apply_detrend=True,taper=taper,pad=pad)
-                    stretch_trace, _ = get_windowed_data(stretched_waveform, 1.,min_ind=left_edge, max_ind=right_edge, apply_detrend=True,taper=taper,pad=pad)
-                                                            
-                    corr = correlate(ref_trace, stretch_trace, mode='full')
-                    corr /= np.sqrt(np.dot(ref_trace, ref_trace) * np.dot(stretch_trace, stretch_trace))
-                    max_coeffs[k] = np.amax(corr)
-
-                best_stretching_factor = s_factors[np.argmax(max_coeffs)]
+                left_edge = min_time_ind+j*window_size_ind
+                right_edge = left_edge + window_size_ind
+                
+                start_time = time.time()
+                if use_optimization:
+                    check_inds, it_number = [0,len(s_factors)-1], 0
+                    do_fi_corr, do_li_corr = True, True
+                    while (np.abs(check_inds[0]-check_inds[1]) > 2) and it_number < len(s_factors):
+                        fi, li = check_inds[0], check_inds[1]
+                        if do_fi_corr:
+                            first_est = do_cwi_correlation(ref,ref_times,comp_waveform,s_factors[fi],left_edge,right_edge,taper,pad)
+                        if do_li_corr:
+                            last_est = do_cwi_correlation(ref,ref_times,comp_waveform,s_factors[li],left_edge,right_edge,taper,pad)
+                        if first_est >= last_est:
+                            check_inds = [fi,fi+int((li-fi)/2)]
+                            do_fi_corr, do_li_corr = False, True
+                        else:
+                            check_inds = [fi+int((li-fi)/2),li]
+                            do_fi_corr, do_li_corr = True, False
+                        it_number += 1
+                    best_index = int((check_inds[1]+check_inds[0])/2)
+                else:
+                    ref_trace0, _ = get_windowed_data_2d(np.tile(ref,(stretched_timeso.shape[0],1)), 1.,min_ind=left_edge, max_ind=right_edge, apply_detrend=True,taper=taper,pad=pad)
+                    stretch_trace0, _ = get_windowed_data_2d(stretched_waveformo, 1.,min_ind=left_edge, max_ind=right_edge, apply_detrend=True,taper=taper,pad=pad)
+                    get_divisor = lambda r,s: np.sqrt(np.dot(r,r)*np.dot(s,s))
+                    max_coeffs = np.zeros(len(s_factors))
+                    for k, s_factor in enumerate(s_factors):
+                        corr = correlate(ref_trace0[k], stretch_trace0[k], mode='full')
+                        corr /= get_divisor(ref_trace0[k],stretch_trace0[k])
+                        max_coeffs[k] = np.amax(corr)
+                        best_index = np.argmax(max_coeffs)
+                best_stretching_factor = s_factors[best_index]
                 lags[j] = best_stretching_factor
+                all_times += time.time()-start_time
 
             all_lags[i] = lags
             time_lag = np.mean(lags)
@@ -482,3 +563,272 @@ def stretching_cwi(reference_waveform, times, data, min_time=0, max_time=1e6,
         return dt_over_t, dt_std_devs
 
     return dt_over_t, dt_std_devs, all_lags
+
+def deprecated_stretching_cwi():
+    """
+    The old stretching cwi for loop structure. I'm
+    keeping this here just in case there is a backwards
+    compatibility issue and the current optimised version
+    doesn't recreate the original.
+    
+
+    for it_number in range(num_iterations):
+
+        stretch_limit = abs(max_stretch) / max(20 * it_number,1) * -1
+        s_factors = np.linspace(stretch_anchor-stretch_limit,stretch_anchor+stretch_limit,201)
+        i_func = interp1d(ref_times,comp_waveform)
+
+        for j in range(num_windows):
+
+            left_edge = min_time_ind+j*window_size_ind
+            right_edge = left_edge + window_size_ind
+    
+            max_coeffs = np.zeros(len(s_factors))
+            for k, s_factor in enumerate(s_factors):
+
+                stretched_times = ref_times / (1+s_factor)
+                stretched_times = np.where(stretched_times < ref_times[-1], stretched_times , 0.)
+                stretched_waveform = i_func(stretched_times)
+
+                ref_trace, _ = get_windowed_data(ref, 1.,min_ind=left_edge, max_ind=right_edge, apply_detrend=True,taper=taper,pad=pad)
+                stretch_trace, _ = get_windowed_data(stretched_waveform, 1.,min_ind=left_edge, max_ind=right_edge, apply_detrend=True,taper=taper,pad=pad)
+                    
+                corr = correlate(ref_trace, stretch_trace, mode='full')
+                corr /= np.sqrt(np.dot(ref_trace, ref_trace) * np.dot(stretch_trace, stretch_trace))
+                max_coeffs[k] = np.amax(corr)
+
+            best_stretching_factor = s_factors[np.argmax(max_coeffs)]
+            lags[j] = best_stretching_factor
+    """
+    pass
+
+def do_cwi_correlation(ref_waveform,ref_times,comp_waveform,s_factor,
+                        left_edge,right_edge,taper,pad):
+    """
+    Support function for stretching CWI to do a stretching
+    CWI of one reference and trace and return the correlation
+    coefficient.
+    """
+
+    stretched_times = ref_times / (1+s_factor)
+    stretched_times = np.where(stretched_times < ref_times[-1], stretched_times , 0.)
+    i_func = interp1d(ref_times,comp_waveform)
+    stretched_waveform = i_func(stretched_times)
+
+    ref_trace, _ = get_windowed_data(ref_waveform, 1.,min_ind=left_edge, max_ind=right_edge, apply_detrend=True,taper=taper,pad=pad)
+    stretch_trace, _ = get_windowed_data(stretched_waveform, 1.,min_ind=left_edge, max_ind=right_edge, apply_detrend=True,taper=taper,pad=pad)
+        
+    corr = correlate(ref_trace, stretch_trace, mode='full')
+    corr /= np.sqrt(np.dot(ref_trace, ref_trace) * np.dot(stretch_trace, stretch_trace))
+    return np.amax(corr)
+
+
+def compute_time_delays(reference_waveform, data, times, trace_bandpass=None,  normalise=False, 
+                        tmin=0., tmax=50., smoothing_amount=0, parabolic_approx=True):
+    '''
+    Function which computes the time delays using cross correlation
+    Positive lag menas the sample  probe waveform lags behind the reference.
+
+    Arguments:
+        --reference_waveform: A reference waveform to compare probe
+            waveforms to. See generate_reference_waveform
+        --data: The data to compare to cross-correlate with the reference. Must
+            be an array of at least one array that has a length equal to referece_waveform
+        --times: A time array for reference_waveform (in units of seconds)
+        --trace_bandpass: A bandpass filter applied to the probe waveforms before 
+            cross correlation
+        --normalise: True to normalise the probe waveforms before comparison
+        --tmin: The minimum time to use for the window in the 
+            cross correlation (in units of microseconds)
+        --tmax: The maximum time for the window in the cross
+            correlation (in units of microseconds)
+        --smoothing_amount: An integer (or tuple) which specifies a number
+            of probe waveforms to average before doing the cross
+            correlation at each posiiton. Only previous waveforms
+            will be averaged with the current waveform. If a tuple is given,
+            the first number is the smoothing amount as specified above, and
+            the subsequent numbers are probe indices to reset the averaging from
+            (e.g. where the pump stops and starts)
+        --parabolic_approx: True to obtain sub-sample accuracy in 
+            the time delays by fitting a parabola around the maximum 
+            three points of the cross correlation, rather than using 
+            the time at the maximum as the delay (see Cespedes, 1995, 
+            Ultrasonic Imaging).
+
+    Returns:
+        --lags: The time delays, front-padded to match the shape of
+            probe_times.
+    '''
+
+    sampling_rate = 1/(times[1]-times[0])
+    probe_data = data.copy()
+    if trace_bandpass:
+        probe_data = bandpass_filter(probe_data, trace_bandpass[0], trace_bandpass[1], sampling_rate)
+    
+    probe_data = detrend(probe_data)
+
+    min_comp_ind = np.where(times >= tmin / 1e6)[0][0]
+    max_comp_ind = np.where(times <= tmax / 1e6)[0][-1]
+
+    if smoothing_amount:
+        if type(smoothing_amount) == type((1,)):
+            break_indices = [0]+list(smoothing_amount[1:])+[probe_data.shape[0]]
+            smoothing_amount = smoothing_amount[0]
+            next_break_ind = 1
+            for i in range(probe_data.shape[0]):
+                probe_data[i] = np.average(probe_data[max(break_indices[next_break_ind-1],i+1-smoothing_amount):i+1],axis=0)
+                if next_break_ind<len(break_indices) and i == break_indices[next_break_ind]-1:
+                    next_break_ind += 1
+        else:
+            for i in range(probe_data.shape[0]):
+                probe_data[i] = np.average(probe_data[max(0,i+1-smoothing_amount):i+1],axis=0)
+
+    lags = np.zeros((probe_data.shape[-2]))
+    for i in range(probe_data.shape[-2]):
+
+        array = detrend(probe_data[i][min_comp_ind:max_comp_ind+1], type='constant')
+        if normalise:
+            array = array / np.amax(np.abs(array))
+        reference = detrend(reference_waveform[min_comp_ind:max_comp_ind+1],type='constant')
+        
+        #plt.plot(times[min_comp_ind:max_comp_ind+1],reference,label='ref')
+        #plt.plot(times[min_comp_ind:max_comp_ind+1],array,label='dat')
+        #plt.legend()
+        #plt.show()
+
+        corr = correlate(reference,array,mode='full')
+        corr_times = np.arange(max_comp_ind+1 - min_comp_ind) / sampling_rate
+        corr_times = np.concatenate((np.flip(-1. * corr_times[1:],axis=0), corr_times))
+
+        max_lag_ind = np.argmax(corr)
+        max_lag = corr_times[max_lag_ind]
+
+        if parabolic_approx:
+            y0, y1, y2 = corr[max_lag_ind-1], corr[max_lag_ind], corr[max_lag_ind+1]
+            delta_hat = (y0-y2) / (2* (y0-2*y1+y2) ) * (1 / sampling_rate)
+            max_lag = max_lag + delta_hat
+
+        lags[i] = max_lag
+
+    lags = lags * -1.
+
+    return lags    
+
+
+def bandpass_filter(data, min_freq, max_freq, sampling_rate):
+    '''
+    Apply a bandpass filter to data. Borrowed from obspy.signal.filter
+    
+    Arguments:
+        --data: the data to be filtered
+        --min_freq: The lower corner frequency of the bandpass filter
+        --max_freq: The upper corner frequency of the bandpass filter
+        --sampling_rate: The sampling rate of the data
+        
+    Returns:
+        --data: The filtered data
+    '''
+    
+    fe = 0.5 * sampling_rate
+    low = min_freq / fe
+    high = max_freq / fe
+    
+    # Raise for some bad scenarios
+    if high - 1.0 > -1e-6:
+        msg = ("Selected high corner frequency ({}) of bandpass is at or "
+            "above Nyquist ({}). No filter applied.").format(max_freq, fe)
+        warnings.warn(msg)
+        return data
+    
+    if low > 1:
+        msg = "Selected low corner frequency is above Nyquist."
+        raise ValueError(msg)
+        
+    z, p, k = iirfilter(4, [low, high], btype='band',
+                        ftype='butter', output='zpk')
+    sos = zpk2sos(z, p, k)
+    filtered_dat = sosfiltfilt(sos, data)
+    
+    return filtered_dat
+
+
+def harmonic_coeffs_decomp(signal, times, freq0, n=7, return_all=False):
+    """
+    Find the coefficients of the harmonics of a 
+    DAET signal using the Gram-Schmidt method 
+    described in Riviere et al., 2013, Pump and
+    probe waves in dynamic acousto-elasticity.
+
+    Arguments:
+      --signal: The signal to decompose
+      --times: The times corresponding to signal
+      --n: The highest harmonic to decompose for. 
+      --freq0: The fundamental frequency (in Hz)
+      --return_all: True to return all the coefficients.
+
+    Returns:
+      --spectral_coeffs: The values of the spectral 
+        coefficients from k=0 to k=n
+      --projected_signal: The reconstructed signal made
+        from the linear sum of the sine and cosine harmonics
+    If return_all is True, then this function also return:
+      --an: The sine harmonics amplitudes
+      --bn: The cosine harmonic amplitudes
+      --qn: The maximum amplitudes of the orthonormal sine
+        components
+      --rn: The maximum amplitudes of the orthonormal cosine
+        components
+      --sn: The orthonormal sine functions
+      --cn: The orthonormal cosine functions
+    """
+
+    def get_subtract_vals(prev_fs, new_f):
+        coeffs = np.sum(np.multiply(prev_fs,np.tile(new_f, (n,1))),axis=1)
+        all_fs = np.expand_dims(coeffs,0).T * prev_fs
+        return np.sum(all_fs, axis=0)
+
+    omega = 2*np.pi*freq0
+    t = times
+
+    sn = np.zeros((n,len(signal)))
+    cn = np.zeros((n,len(signal)))
+
+    w = omega
+    sn[0] = np.sin(w*t) / np.sqrt(np.sum(np.sin(w*t)**2))
+    cn[0] = (np.cos(w*t) - np.sum(sn[0]*np.cos(w*t))*sn[0]) / np.sqrt(np.sum(np.cos(w*t)**2))
+
+    for i in range(2,n+1):
+        w = omega*i
+        bs = np.sin(w*t)
+        bc = np.cos(w*t)
+
+        sn[i-1] = (bs - get_subtract_vals(sn,bs) - get_subtract_vals(cn,bs)) / np.sqrt(np.sum(bs**2))
+        cn[i-1] = (bc - get_subtract_vals(sn,bc) - get_subtract_vals(cn,bc)) / np.sqrt(np.sum(bc**2))
+
+    an = np.dot(sn, signal)
+    bn = np.dot(cn, signal)
+    qn = sn.max(axis=1)
+    rn = cn.max(axis=1)
+
+    # Add in the 0th (DC offset) component
+    an = np.concatenate(([0],an))
+    bn = np.concatenate(([np.mean(signal)],bn))
+    qn = np.concatenate(([0],qn))
+    rn = np.concatenate(([1],rn))
+    sn = np.concatenate(([[0]*len(times)],sn))
+    cn = np.concatenate(([[1]*len(times)],cn))
+
+    spectral_coeffs = np.sqrt((an*qn)**2 + (bn*rn)**2)
+    projected_signal = np.sum(np.tile(an,[len(times),1]).T*sn,axis=0)+np.sum(np.tile(bn,[len(times),1]).T*cn,axis=0)
+    
+    # plt.plot(times,signal,'rx')
+    # plt.plot(times,projected_signal,'b-')
+    # plt.show()
+
+    # plt.plot(spectral_coeffs)
+    # plt.show()
+
+    if not return_all:
+        return spectral_coeffs, projected_signal
+    else:
+        return spectral_coeffs, projected_signal, an, bn, qn, rn, sn, cn
